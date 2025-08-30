@@ -1,0 +1,484 @@
+all-shopping-complex
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+/**
+
+Anime Video Generator – Frontend MVP (No server required, but API hooks included)
+
+
+---
+
+What this does (today):
+
+Takes a Story (Hindi/English).
+
+
+Auto-splits into Scenes.
+
+
+Lets you upload character images (Hero/Enemy/Extras) once and re-use per scene.
+
+
+Auto-picks a background style per scene from the story text (keyword-based).
+
+
+Auto-assigns simple motion per scene (slide, zoom, shake, slash).
+
+
+Renders frames on an <canvas>, records a WebM video via MediaRecorder, and lets you download.
+
+
+Optional subtitles burned-in from the scene text.
+
+
+What you can plug in later (API hooks included below):
+
+/api/tts : Text → voice (returns .mp3/.wav). (See sample Express server at bottom of this file.)
+
+
+/api/bg  : Advanced background generation (e.g., Stable Diffusion/ControlNet/AnimateDiff).
+
+
+/api/iv2 : Image-to-Video (AnimateDiff). Return per-scene short clips to stitch with FFmpeg.
+
+
+IMPORTANT:
+
+This is a browser-only MVP: no GPU required. Motions are keyframe/tween, NOT real AI yet.
+
+
+Voice via browser SpeechSynthesis can be previewed but won’t be captured in the output file.
+
+
+To capture voice in the exported video, attach a real TTS file via /api/tts and enable it below. */
+
+
+
+// ---------- Utility Types ----------
+
+type Scene = { id: number; text: string; bgStyle: BgStyle; motion: MotionPreset; durationSec: number; characters: string[]; // fileIds chosen for this scene };
+
+type BgStyle = | { type: "gradient"; from: string; to: string } | { type: "solid"; color: string } | { type: "image"; fileId: string };
+
+type MotionPreset = | { type: "kenburns" } | { type: "slide"; direction: "left" | "right" | "up" | "down" } | { type: "shake" } | { type: "slash" };
+
+// ---------- Helpers ----------
+
+function splitStoryToScenes(story: string): string[] { // Split on blank lines first; if not present, split by sentences. const blocks = story .split(/\n\n+/) .map((b) => b.trim()) .filter(Boolean); if (blocks.length > 1) return blocks; // Fallback: naive sentence split const sent = story .split(/(?<=[.!?।])\s+/) .map((s) => s.trim()) .filter((s) => s.length > 0); return sent.length ? sent : [story.trim()].filter(Boolean); }
+
+function pickBgFromText(text: string): BgStyle { const t = text.toLowerCase(); // Simple keyword → background mapping if (/forest|jungle|वन|जंगल/.test(t)) return { type: "gradient", from: "#0f5132", to: "#052b1f" }; if (/temple|mandir|मंदिर|धर्म|देव/.test(t)) return { type: "gradient", from: "#8e2de2", to: "#4a00e0" }; if (/battle|war|fight|युद्ध|लड़ाई|रण/.test(t)) return { type: "gradient", from: "#4b000f", to: "#12000a" }; if (/city|town|market|शहर|बाज़ार/.test(t)) return { type: "gradient", from: "#0f2027", to: "#203a43" }; if (/night|moon|रात|चाँद/.test(t)) return { type: "gradient", from: "#141e30", to: "#243b55" }; if (/mountain|पर्वत|पहाड़/.test(t)) return { type: "gradient", from: "#355c7d", to: "#6c5b7b" }; return { type: "gradient", from: "#1f1c2c", to: "#928dab" }; }
+
+function pickMotionFromText(text: string): MotionPreset { const t = text.toLowerCase(); if (/slash|sword|काट|वार|तलवार/.test(t)) return { type: "slash" }; if (/run|charge|दौड़|झपट/.test(t)) return { type: "slide", direction: "right" }; if (/jump|कूद/.test(t)) return { type: "slide", direction: "up" }; if (/quake|गर्ज|गरज|क्रोध/.test(t)) return { type: "shake" }; return { type: "kenburns" }; }
+
+// Load an Image from a File function fileToImage(file: File): Promise<HTMLImageElement> { return new Promise((resolve, reject) => { const url = URL.createObjectURL(file); const img = new Image(); img.onload = () => resolve(img); img.onerror = (e) => reject(e); img.src = url; }); }
+
+function drawRoundedRect( ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number ) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+
+// ---------- Main Component ----------
+
+export default function AnimeVideoGenerator() { const [story, setStory] = useState<string>( "रुद्रवान युद्धभूमि में प्रवेश करता है। दुश्मन गर्जना करता है। तलवारें टकराती हैं, चिंगारियाँ उड़ती हैं। रात का आकाश बादलों से घिरा है।" ); const [scenes, setScenes] = useState<Scene[]>([]); const [files, setFiles] = useState<Record<string, File>>({}); const [fileOrder, setFileOrder] = useState<string[]>([]); // to keep UI order const [width, setWidth] = useState(720); const [height, setHeight] = useState(1280); const [fps, setFps] = useState(30); const [showSubtitles, setShowSubtitles] = useState(true); const [useApiTts, setUseApiTts] = useState(false); const [isGenerating, setIsGenerating] = useState(false); const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+
+const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+// Parse Story → Scenes const parseScenes = () => { const raw = splitStoryToScenes(story); const next: Scene[] = raw.map((text, i) => ({ id: i + 1, text, bgStyle: pickBgFromText(text), motion: pickMotionFromText(text), durationSec: 3.0, characters: [], })); setScenes(next); };
+
+useEffect(() => { parseScenes(); // eslint-disable-next-line react-hooks/exhaustive-deps }, []);
+
+// Handle uploads const onFiles = (incoming: FileList | null) => { if (!incoming || incoming.length === 0) return; const updated = { ...files }; const order = [...fileOrder]; Array.from(incoming).forEach((f) => { const id = ${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${f.name}; updated[id] = f; order.push(id); }); setFiles(updated); setFileOrder(order); };
+
+const removeFile = (id: string) => { const copy = { ...files }; delete copy[id]; setFiles(copy); setFileOrder((o) => o.filter((x) => x !== id)); };
+
+// Scene editing const updateScene = (id: number, patch: Partial<Scene>) => { setScenes((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s))); };
+
+// Video Generation (Canvas + MediaRecorder) const generateVideo = async () => { if (!canvasRef.current) return; setIsGenerating(true); setDownloadUrl(null);
+
+const canvas = canvasRef.current;
+canvas.width = width;
+canvas.height = height;
+const ctx = canvas.getContext("2d");
+if (!ctx) {
+  setIsGenerating(false);
+  return;
+}
+
+// Prepare character images
+const imageCache: Record<string, HTMLImageElement> = {};
+for (const id of Object.keys(files)) {
+  imageCache[id] = await fileToImage(files[id]);
+}
+
+// If using API TTS, fetch per-scene audio and build a joined audio track
+let audioCtx: AudioContext | null = null;
+let destination: MediaStreamAudioDestinationNode | null = null;
+
+if (useApiTts) {
+  audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+  destination = audioCtx.createMediaStreamDestination();
+
+  let currentStart = audioCtx.currentTime + 0.3; // small delay before start
+
+  for (const scene of scenes) {
+    try {
+      const q = encodeURIComponent(scene.text);
+      // Expect: server returns { mime: "audio/mpeg", arrayBuffer: <bytes> }
+      const res = await fetch(`/api/tts?text=${q}`);
+      if (res.ok) {
+        const arr = await res.arrayBuffer();
+        const buf = await audioCtx.decodeAudioData(arr.slice(0));
+        const src = audioCtx.createBufferSource();
+        src.buffer = buf;
+        src.connect(destination);
+        src.start(currentStart);
+        currentStart += scene.durationSec + 0.2; // scene length + tiny gap
+      }
+    } catch (e) {
+      console.warn("TTS failed for a scene:", e);
+    }
+  }
+}
+
+const canvasStream = (canvas as any).captureStream(fps) as MediaStream;
+const mixedStream = new MediaStream([
+  ...canvasStream.getVideoTracks(),
+  ...(useApiTts && destination ? destination.stream.getAudioTracks() : []),
+]);
+
+const recorder = new MediaRecorder(mixedStream, {
+  mimeType: "video/webm;codecs=vp9,opus",
+  videoBitsPerSecond: 6_000_000,
+  audioBitsPerSecond: 128_000,
+});
+
+const chunks: BlobPart[] = [];
+recorder.ondataavailable = (e) => {
+  if (e.data && e.data.size > 0) chunks.push(e.data);
+};
+
+const done: Promise<void> = new Promise((resolve) => {
+  recorder.onstop = () => resolve();
+});
+
+recorder.start();
+
+// Render loop across scenes → frames
+let globalTime = 0; // seconds
+
+const drawBg = (bg: BgStyle) => {
+  if (!ctx) return;
+  if (bg.type === "solid") {
+    ctx.fillStyle = bg.color;
+    ctx.fillRect(0, 0, width, height);
+  } else if (bg.type === "gradient") {
+    const grad = ctx.createLinearGradient(0, 0, 0, height);
+    grad.addColorStop(0, bg.from);
+    grad.addColorStop(1, bg.to);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, width, height);
+  } else if (bg.type === "image") {
+    const img = imageCache[bg.fileId];
+    if (img) {
+      // cover
+      const scale = Math.max(width / img.width, height / img.height);
+      const w = img.width * scale;
+      const h = img.height * scale;
+      const x = (width - w) / 2;
+      const y = (height - h) / 2;
+      ctx.drawImage(img, x, y, w, h);
+    } else {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, width, height);
+    }
+  }
+};
+
+const drawCharacters = (
+  ids: string[],
+  tNorm: number, // 0..1 within scene
+  motion: MotionPreset
+) => {
+  const pad = 40;
+  const baseW = Math.min(width * 0.8, 600);
+  const baseH = Math.min(height * 0.5, 700);
+
+  const slots = ids.slice(0, 3); // up to 3 characters
+  const positions = [
+    { x: width * 0.25, y: height * 0.55 },
+    { x: width * 0.55, y: height * 0.6 },
+    { x: width * 0.75, y: height * 0.5 },
+  ];
+
+  slots.forEach((id, i) => {
+    const img = imageCache[id];
+    if (!img) return;
+
+    // scale to fit base box
+    const scale = Math.min(baseW / img.width, baseH / img.height);
+    const w = img.width * scale;
+    const h = img.height * scale;
+
+    let x = positions[i].x - w / 2;
+    let y = positions[i].y - h / 2;
+
+    // Motions
+    if (motion.type === "slide") {
+      const dist = 150;
+      if (motion.direction === "left") x -= (1 - tNorm) * dist;
+      if (motion.direction === "right") x += (1 - tNorm) * dist;
+      if (motion.direction === "up") y -= (1 - tNorm) * dist;
+      if (motion.direction === "down") y += (1 - tNorm) * dist;
+    } else if (motion.type === "shake") {
+      const amp = 8;
+      x += Math.sin(tNorm * 50) * amp;
+      y += Math.cos(tNorm * 60) * amp;
+    } else if (motion.type === "slash") {
+      // quick forward lunge near mid
+      const p = Math.max(0, Math.sin(tNorm * Math.PI));
+      x += p * 30;
+    } else if (motion.type === "kenburns") {
+      const zoom = 1 + tNorm * 0.03;
+      const cx = positions[i].x - (w * zoom) / 2;
+      const cy = positions[i].y - (h * zoom) / 2;
+      ctx.save();
+      ctx.translate(cx + (w * zoom) / 2, cy + (h * zoom) / 2);
+      ctx.scale(zoom, zoom);
+      ctx.translate(-(cx + (w * zoom) / 2), -(cy + (h * zoom) / 2));
+      ctx.drawImage(img, cx, cy, w * zoom, h * zoom);
+      ctx.restore();
+      return; // already drawn
+    }
+
+    ctx.drawImage(img, x, y, w, h);
+  });
+
+  // Slash effect overlay
+  if (motion.type === "slash") {
+    const p = Math.max(0, Math.sin(tNorm * Math.PI));
+    ctx.save();
+    ctx.globalAlpha = 0.4 * p;
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 8;
+    drawRoundedRect(ctx, 30, height * 0.35, width - 60, height * 0.3, 24);
+    ctx.stroke();
+    ctx.restore();
+  }
+};
+
+const drawSubtitle = (text: string) => {
+  const pad = 28;
+  const boxW = width - pad * 2;
+  const boxH = 120;
+
+  ctx.save();
+  ctx.globalAlpha = 0.75;
+  ctx.fillStyle = "#000";
+  drawRoundedRect(ctx, pad, height - boxH - pad, boxW, boxH, 18);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 28px ui-sans-serif, system-ui, -apple-system";
+
+  // Wrap text
+  const words = text.split(/\s+/);
+  let line = "";
+  const lines: string[] = [];
+  for (const w of words) {
+    const test = line ? line + " " + w : w;
+    if (ctx.measureText(test).width < boxW - 24) {
+      line = test;
+    } else {
+      lines.push(line);
+      line = w;
+    }
+  }
+  if (line) lines.push(line);
+
+  const lh = 34;
+  const startY = height - boxH - pad + 24 + lh;
+  lines.slice(-3).forEach((ln, i) => {
+    ctx.fillText(ln, pad + 16, startY + i * lh);
+  });
+  ctx.restore();
+};
+
+// Main render timeline
+for (const scene of scenes) {
+  const totalFrames = Math.max(1, Math.floor(scene.durationSec * fps));
+  for (let f = 0; f < totalFrames; f++) {
+    const tNorm = f / (totalFrames - 1 || 1); // 0..1
+
+    // clear
+    ctx.clearRect(0, 0, width, height);
+
+    // bg
+    drawBg(scene.bgStyle);
+    // characters
+    drawCharacters(scene.characters, tNorm, scene.motion);
+    // subtitles
+    if (showSubtitles) drawSubtitle(scene.text);
+
+    // step time (draw next frame)
+    await new Promise((r) => setTimeout(r, 1000 / fps));
+  }
+  globalTime += scene.durationSec;
+}
+
+recorder.stop();
+await done;
+const blob = new Blob(chunks, { type: "video/webm" });
+const url = URL.createObjectURL(blob);
+setDownloadUrl(url);
+setIsGenerating(false);
+
+};
+
+return ( <div className="min-h-screen w-full bg-neutral-950 text-neutral-100"> <div className="max-w-6xl mx-auto p-6 space-y-6"> <header className="flex items-center justify-between"> <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Anime Video Generator – MVP</h1> <a
+className="text-xs md:text-sm opacity-70 hover:opacity-100 underline"
+href="#dev-notes"
+> Developer Notes </a> </header>
+
+<div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      {/* Left: Controls */}
+      <section className="lg:col-span-2 space-y-6">
+        {/* Story Input */}
+        <div className="bg-neutral-900/60 rounded-2xl p-4 shadow">
+          <label className="block text-sm font-semibold mb-2">Story / Script</label>
+          <textarea
+            className="w-full min-h-[120px] md:min-h-[160px] rounded-xl bg-neutral-900 border border-neutral-700 p-3 outline-none focus:ring-2 focus:ring-indigo-500"
+            value={story}
+            onChange={(e) => setStory(e.target.value)}
+            placeholder="यहाँ अपनी कहानी लिखें..."
+          />
+          <div className="flex gap-3 mt-3">
+            <button
+              onClick={parseScenes}
+              className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-95 transition"
+            >
+              Parse Scenes
+            </button>
+            <button
+              onClick={() => {
+                setStory("");
+                setScenes([]);
+              }}
+              className="px-4 py-2 rounded-xl bg-neutral-800 hover:bg-neutral-700 border border-neutral-700"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+
+        {/* Global Settings */}
+        <div className="bg-neutral-900/60 rounded-2xl p-4 shadow grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div>
+            <label className="block text-xs opacity-70">Width</label>
+            <input
+              type="number"
+              className="w-full rounded-lg bg-neutral-900 border border-neutral-700 p-2"
+              value={width}
+              onChange={(e) => setWidth(parseInt(e.target.value || "720"))}
+            />
+          </div>
+          <div>
+            <label className="block text-xs opacity-70">Height</label>
+            <input
+              type="number"
+              className="w-full rounded-lg bg-neutral-900 border border-neutral-700 p-2"
+              value={height}
+              onChange={(e) => setHeight(parseInt(e.target.value || "1280"))}
+            />
+          </div>
+          <div>
+            <label className="block text-xs opacity-70">FPS</label>
+            <input
+              type="number"
+              className="w-full rounded-lg bg-neutral-900 border border-neutral-700 p-2"
+              value={fps}
+              onChange={(e) => setFps(Math.max(1, parseInt(e.target.value || "30")))}
+            />
+          </div>
+          <div className="flex items-end gap-2">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={showSubtitles}
+                onChange={(e) => setShowSubtitles(e.target.checked)}
+              />
+              Subtitles
+            </label>
+          </div>
+          <div className="flex items-end gap-2 col-span-2">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={useApiTts}
+                onChange={(e) => setUseApiTts(e.target.checked)}
+              />
+              Use /api/tts (voice captured into video)
+            </label>
+          </div>
+        </div>
+
+        {/* Scenes List */}
+        <div className="space-y-4">
+          {scenes.map((sc) => (
+            <div key={sc.id} className="bg-neutral-900/60 rounded-2xl p-4 shadow">
+              <div className="flex items-center justify-between">
+                <h3 className="font-bold">Scene {sc.id}</h3>
+                <div className="text-xs opacity-70">~{sc.durationSec.toFixed(1)}s</div>
+              </div>
+
+              <textarea
+                value={sc.text}
+                onChange={(e) => updateScene(sc.id, { text: e.target.value })}
+                className="w-full mt-2 rounded-lg bg-neutral-900 border border-neutral-700 p-2"
+              />
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
+                {/* Duration */}
+                <div>
+                  <label className="block text-xs opacity-70">Duration (s)</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={sc.durationSec}
+                    onChange={(e) => updateScene(sc.id, { durationSec: Math.max(0.5, parseFloat(e.target.value || "3")) })}
+                    className="w-full rounded-lg bg-neutral-900 border border-neutral-700 p-2"
+                  />
+                </div>
+
+                {/* Motion */}
+                <div>
+                  <label className="block text-xs opacity-70">Motion</label>
+                  <select
+                    value={JSON.stringify(sc.motion)}
+                    onChange={(e) => updateScene(sc.id, { motion: JSON.parse(e.target.value) })}
+                    className="w-full rounded-lg bg-neutral-900 border border-neutral-700 p-2"
+                  >
+                    <option value={JSON.stringify({ type: "kenburns" })}>Ken Burns</option>
+                    <option value={JSON.stringify({ type: "slide", direction: "left" })}>Slide Left</option>
+                    <option value={JSON.stringify({ type: "slide", direction: "right" })}>Slide Right</option>
+                    <option value={JSON.stringify({ type: "slide", direction: "up" })}>Slide Up</option>
+                    <option value={JSON.stringify({ type: "slide", direction: "down" })}>Slide Down</option>
+                    <option value={JSON.stringify({ type: "shake" })}>Shake</option>
+                    <option value={JSON.stringify({ type: "slash" })}>Slash (FX)</option>
+                  </select>
+                </div>
+
+                {/* Background */}
+                <div>
+                  <label className="block text-xs opacity-70">Background</label>
+                  <select
+                    value={sc.bgStyle.type}
+                    onChange={(e) => {
+                      const type = e.target.value as BgStyle["type"];
+                      if (type === "image") {
+                        updateScene(sc.id, { bgStyle: { type: "image", fileId: sc.bgStyle.type === "image" ? sc.bgStyle.fileId : "" } });
+                      } else if (type === "solid") {
+                        updateScene(sc.id, { bgStyle: { type: "solid", color: "#000000" } });
+                      } else {
+                        updateScene(sc.id, { bgStyle: pickBgFromText(sc.text) });
+                      }
+                    }}
+                    className="w-full rounded-lg bg-neutral-900 border border-neutral-700 p-2"
+                  >
+                    <option value="gradient">Auto (Gradient)</optio
